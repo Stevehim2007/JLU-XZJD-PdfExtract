@@ -90,7 +90,7 @@ def dwidth(s):
     return n
 
 
-class Bar:
+class _BarBuiltin:
     """单行实时进度条：先量终端宽度，再决定画什么 —— 永远只占一行。
 
     放不下时按优先级让路：额外信息 → 剩余时间 → 百分比小数 → 标签截断 → 丢掉计数。
@@ -837,6 +837,70 @@ class ExtractError(Exception):
     """抽帧阶段的错误（可被 seek 兜底重试）。"""
 
 
+# ── 进度条：优先 tqdm（业界标准），没装就退回内置单行条 ────────────────────
+BAR_LIB = "auto"          # auto=有 tqdm 就用 / tqdm / builtin
+
+
+def _tqdm_mod():
+    if BAR_LIB == "builtin" or os.environ.get("SLIDE2PDF_NO_TQDM"):
+        return None
+    try:
+        from tqdm import tqdm as _tqdm
+        return _tqdm
+    except Exception:
+        return None
+
+
+class _BarTqdm:
+    """tqdm 适配层：对外 API 与 _BarBuiltin 完全一致（update 传**绝对值**）。"""
+
+    def __init__(self, total=0, label="", width=26, enabled=None, stream=None,
+                 min_bar=6, min_interval=0.1, unit=""):
+        if enabled is None:
+            shown = sys.stderr.isatty() if PROGRESS is None else bool(PROGRESS)
+        else:
+            shown = bool(enabled) and PROGRESS is not False
+        self.enabled = bool(shown)
+        self.unit = unit
+        self.n = 0
+        self.t0 = time.time()      # 调用方会用它算"解码用时"
+        self._t = _tqdm_mod()(
+            total=int(total) if total else None,
+            desc=(label or "").strip(),
+            unit=(unit or "it"),
+            file=stream or sys.stderr,
+            disable=not self.enabled,
+            ascii=True,              # Windows GBK 终端也不会打不出方块
+            dynamic_ncols=True,      # 跟着终端宽度走
+            mininterval=float(min_interval),
+            smoothing=0.1,
+            leave=False,             # 跑完擦掉，不留一串历史条
+        )
+
+    def update(self, n=None, extra="", force=False):
+        if not self.enabled:
+            return
+        n = (self._t.n + 1) if n is None else int(n)
+        self.n = n
+        self._t.update(max(0, n - self._t.n))
+        if extra:
+            self._t.set_postfix_str(extra, refresh=False)
+
+    def done(self, keep=False):
+        if not self.enabled:
+            return
+        if keep:
+            self._t.leave = True
+        self._t.close()
+
+
+def Bar(total=0, label="", width=26, enabled=None, stream=None,
+        min_bar=6, min_interval=0.1, unit=""):
+    """进度条工厂：装了 tqdm 用 tqdm，否则用内置的单行实现（API 相同）。"""
+    cls = _BarTqdm if _tqdm_mod() is not None else _BarBuiltin
+    return cls(total, label, width, enabled, stream, min_bar, min_interval, unit)
+
+
 def select_expr(frames):
     idx = sorted(set(int(f) for f in frames))
     parts, start, prev = [], None, None
@@ -1520,6 +1584,8 @@ def main(argv=None):
                     help="抽帧方式：auto=先试 select 表达式，失败或候选过多自动改逐帧 seek；"
                          "select=只用表达式；seek=只用逐帧 seek（最稳，慢些）")
     g4.add_argument("--keep-temp", action="store_true", help="保留临时目录")
+    g4.add_argument("--bar", choices=("auto", "tqdm", "builtin"), default="auto",
+                    help="进度条实现：auto=有 tqdm 就用（默认）/ tqdm / builtin=内置单行条")
     g4.add_argument("--progress", dest="progress", action="store_true", default=None,
                     help="强制显示进度条（默认只在终端里显示）")
     g4.add_argument("--no-progress", dest="progress", action="store_false",
@@ -1527,7 +1593,8 @@ def main(argv=None):
     g4.add_argument("--ffmpeg")
     g4.add_argument("--ffprobe")
     a = ap.parse_args(argv)
-    global DOWNLOAD_POLICY, ASSUME_YES
+    global DOWNLOAD_POLICY, ASSUME_YES, BAR_LIB
+    BAR_LIB = a.bar
     DOWNLOAD_POLICY = a.download
     ASSUME_YES = bool(getattr(a, "yes", False))
     if a.doctor:                                 # 只做自检，不需要视频
