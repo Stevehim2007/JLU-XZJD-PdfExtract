@@ -27,14 +27,17 @@ slide2pdf —— 把"课件录屏视频"还原成 PDF。
 """
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import zipfile
 import unicodedata
 
 import numpy as np
@@ -96,8 +99,9 @@ class Bar:
     """
 
     def __init__(self, total=0, label="", width=26, enabled=None,
-                 stream=None, min_bar=6, min_interval=0.1):
+                 stream=None, min_bar=6, min_interval=0.1, unit=""):
         self.total = int(total or 0)
+        self.unit = unit
         self.label = label
         self.width = int(width)
         self.min_bar = int(min_bar)
@@ -118,6 +122,7 @@ class Bar:
         self._last_n = None
         self._last_line = None
         self._pad = 0
+        self.unit = unit
         self.shown = False
         self.n = 0
 
@@ -160,6 +165,8 @@ class Bar:
             pct = ("%5.1f%%" if pct_w == 6 else "%4.1f%%") % (frac * 100.0)
             k = self.total >= 10000
             c = "%s/%s" % (self._cnt(n, k), self._cnt(self.total, k))
+            if getattr(self, "unit", ""):
+                c += self.unit
             e = ""
             if eta_txt is not None:
                 e = eta_txt
@@ -349,6 +356,192 @@ def _candidates(name, explicit=None):
     return out
 
 
+# ── 自检 + 自动下载 ffmpeg ────────────────────────────────────────────────
+DOWNLOAD_POLICY = "auto"      # auto=终端里询问 / force=直接下 / never=不下载
+ASSUME_YES = False
+FFMPEG_HOME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "auto")
+USER_AGENT = "slide2pdf/1.0 (+https://github.com/Stevehim2007/JLU-XZJD-PdfExtract)"
+
+
+def _human(n):
+    if n >= 1073741824:
+        return "%.1f GB" % (n / 1073741824.0)
+    if n >= 1048576:
+        return "%.1f MB" % (n / 1048576.0)
+    if n >= 1024:
+        return "%.1f KB" % (n / 1024.0)
+    return "%d B" % n
+
+
+def _ffmpeg_sources():
+    """按平台给出可自动下载的静态版（只放官方/半官方 HTTPS 源）。"""
+    if os.name == "nt":
+        u = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        return [dict(url=u, kind="zip", members=("ffmpeg.exe", "ffprobe.exe"),
+                     digest=("sha256", u + ".sha256"), size=119467219)]
+    if sys.platform.startswith("linux"):
+        u = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+        return [dict(url=u, kind="tar.xz", members=("ffmpeg", "ffprobe"),
+                     digest=("md5", u + ".md5"), size=41888096)]
+    return []          # macOS：没有稳定的官方静态包，引导用 brew
+
+
+def http_download(url, dest, label="下载"):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        mb = max(1, total // 1048576) if total else 0
+        bar = Bar(mb, label, unit="MB")
+        got = 0
+        while True:
+            chunk = r.read(262144)
+            if not chunk:
+                break
+            f.write(chunk)
+            got += len(chunk)
+            bar.update(got // 1048576)
+        bar.done()
+        return got
+
+
+def _read_digest(url):
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            txt = r.read(4096).decode("utf-8", "replace").strip()
+    except Exception:
+        return None
+    tok = txt.split()[0] if txt else ""
+    return tok.lower() if all(ch in "0123456789abcdef" for ch in tok.lower()) else None
+
+
+def _file_digest(path, algo):
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1048576), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _extract_binaries(archive, kind, members, dest):
+    """只把 members 里的几个可执行文件取出来（不整包解压，省空间）。"""
+    got = {}
+    if kind == "zip":
+        with zipfile.ZipFile(archive) as z:
+            for n in z.namelist():
+                b = os.path.basename(n)
+                if b in members and b not in got and not n.endswith("/"):
+                    got[b] = z.read(n)
+    else:
+        mode = {"tar.xz": "r:xz", "tar.gz": "r:gz", "tar.bz2": "r:bz2"}[kind]
+        with tarfile.open(archive, mode) as t:
+            for m in t.getmembers():
+                b = os.path.basename(m.name)
+                if b in members and b not in got and m.isfile():
+                    got[b] = t.extractfile(m).read()
+    if not got:
+        return []
+    os.makedirs(dest, exist_ok=True)
+    out = []
+    for b, data in got.items():
+        p = os.path.join(dest, b)
+        with open(p, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(p, 0o755)
+        except OSError:
+            pass
+        out.append(p)
+    return out
+
+
+def install_ffmpeg(dest=None, assume_yes=None):
+    """自检失败时自动下载一份静态版 ffmpeg 到 ./bin/auto/。返回目录或 None。"""
+    if DOWNLOAD_POLICY == "never":
+        return None
+    assume_yes = ASSUME_YES if assume_yes is None else assume_yes
+    srcs = _ffmpeg_sources()
+    if not srcs:
+        return None
+    src = srcs[0]
+    dest = dest or FFMPEG_HOME
+    log("没找到能用的 ffmpeg，可以自动下载一份静态版：")
+    log("  来源：%s" % src["url"])
+    log("  大小：约 %s   放到：%s" % (_human(src["size"]), dest))
+    if DOWNLOAD_POLICY == "auto":
+        if not assume_yes and not sys.stdin.isatty():
+            log("  当前不是交互终端，跳过自动下载。想直接下就加 --download-ffmpeg")
+            return None
+        if not assume_yes:
+            try:
+                ans = input("  现在下载？（Y/n） ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if ans not in ("", "y", "yes"):
+                log("  已取消。也可以自己装：Windows winget install Gyan.FFmpeg / "
+                    "Linux apt install ffmpeg")
+                return None
+    tmpdir = tempfile.mkdtemp(prefix="ffmpeg-dl-")
+    ext = {"zip": ".zip", "tar.xz": ".tar.xz"}.get(src["kind"], ".download")
+    arch = os.path.join(tmpdir, "pkg" + ext)
+    t0 = time.time()
+    try:
+        size = http_download(src["url"], arch, "  下载 ffmpeg")
+        log("  下载完成：%s，用时 %.1fs" % (_human(size), time.time() - t0))
+        algo, url = src["digest"]
+        want = _read_digest(url)
+        if want:
+            got = _file_digest(arch, algo)
+            if got != want:
+                log("  ⚠ 校验失败：%s 期望 %s 实际 %s，已放弃" % (algo, want[:12], got[:12]))
+                return None
+            log("  校验通过（%s %s…）" % (algo, got[:12]))
+        else:
+            log("  ⚠ 没取到官方校验值，跳过校验（只校验了能解压 + 能运行）")
+        files = _extract_binaries(arch, src["kind"], src["members"], dest)
+    except Exception as e:
+        log("  ⚠ 自动下载失败：%s: %s" % (type(e).__name__, e))
+        return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if not files:
+        log("  ⚠ 压缩包里没找到 ffmpeg/ffprobe")
+        return None
+    exe = os.path.join(dest, "ffmpeg" + (".exe" if os.name == "nt" else ""))
+    if not _smoke(exe):
+        log("  ⚠ 下载到的 ffmpeg 跑不起来（%s）" % exe)
+        return None
+    log("  ✅ 就绪：%s" % dest)
+    log("     以后重跑会自动用这份；想换系统装的可删掉该目录")
+    return dest
+
+
+def doctor(ffmpeg=None, ffprobe=None):
+    """把每个候选路径的体检结果摊开：能不能执行、冒烟测试过不过。"""
+    log("ffmpeg/ffprobe 自检")
+    for name, explicit in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe)):
+        log(" %s：" % name)
+        seen = []
+        for c in _candidates(name, explicit):
+            if not c or c in seen:
+                continue
+            seen.append(c)
+            if not os.path.isfile(c):
+                continue
+            ok_platform = _exe_for_platform(c)
+            ok_run = _smoke(c) if ok_platform else False
+            mark = "✅" if ok_run else ("⛔" if not ok_platform else "❌")
+            why = "" if ok_run else ("  不是本系统的可执行文件" if not ok_platform
+                                     else "  无法执行/-version 失败")
+            log("   %s %s%s" % (mark, c, why))
+        if not seen:
+            log("   （没有候选）")
+    srcs = _ffmpeg_sources()
+    log(" 自动下载：%s" % ("可用（%s）" % srcs[0]["url"] if srcs
+                          else "本平台不支持（macOS 用 brew install ffmpeg）"))
+
 def find_tool(name, explicit=None, required=True):
     """找一个当前系统**真的能执行**的 ffmpeg/ffprobe，返回路径。"""
     tried = []
@@ -370,6 +563,12 @@ def find_tool(name, explicit=None, required=True):
             break
     if not required:
         return None
+    if name == "ffmpeg" and DOWNLOAD_POLICY != "never":
+        d = install_ffmpeg()
+        if d:
+            got = os.path.join(d, name + ext)
+            if _smoke(got):
+                return got
     if name == "ffmpeg":
         hint = ("找不到能用的 ffmpeg。\n"
                 "  Windows: winget install Gyan.FFmpeg\n"
@@ -1303,6 +1502,14 @@ def main(argv=None):
     g4.add_argument("--dpi", type=float, default=150, help="PDF 页面 DPI，默认 150")
     g4.add_argument("--preview", help="输出一张选页拼图 jpg")
     g4.add_argument("--csv", help="输出页面时间对照表 csv")
+    g4.add_argument("--doctor", action="store_true",
+                    help="只做自检：列出找到的 ffmpeg/ffprobe 候选、体检结果和建议")
+    g4.add_argument("--download-ffmpeg", dest="download", action="store_const",
+                    const="force", default="auto",
+                    help="找不到 ffmpeg 时直接下载静态版到 ./bin/auto/（不问）")
+    g4.add_argument("--no-download", dest="download", action="store_const",
+                    const="never", help="禁止自动下载（只给安装提示）")
+    g4.add_argument("-y", "--yes", action="store_true", help="所有确认都回答 yes")
     g4.add_argument("--merge", nargs="+", metavar="PDF",
                     help="只合并 PDF（不处理视频）：--merge a.pdf b.pdf -o out.pdf")
     g4.add_argument("--merge-raw", action="store_true",
@@ -1320,6 +1527,12 @@ def main(argv=None):
     g4.add_argument("--ffmpeg")
     g4.add_argument("--ffprobe")
     a = ap.parse_args(argv)
+    global DOWNLOAD_POLICY, ASSUME_YES
+    DOWNLOAD_POLICY = a.download
+    ASSUME_YES = bool(getattr(a, "yes", False))
+    if a.doctor:                                 # 只做自检，不需要视频
+        doctor(a.ffmpeg, a.ffprobe)
+        return 0
     if a.merge:                                  # 合并模式：与视频无关
         outdir = resolve_outdir(a.merge[0], a.outdir)
         out = check_out_path(pick_out(a.out, outdir, "merged.pdf"), "合并输出 PDF")
