@@ -1,0 +1,19 @@
+# 依赖与二进制
+venv/
+bin/
+*.exe
+*.zip
+
+# 产物
+*.pdf
+*.mp4
+*.mkv
+work/
+png/
+preview*.jpg
+*.csv
+!requirements.txt
+
+# Python
+__pycache__/
+*.pyc
