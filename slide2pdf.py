@@ -1125,7 +1125,7 @@ def pair_metrics(S, i, j):
     return chg, loss, add
 
 
-def dedupe(S, cands, verbose=False):
+def dedupe(S, cands, verbose=False, only=None):
     """剔除重复页，并把同一页的"逐步补内容(build)"合并成最完整的那一帧。
 
     相邻两帧若"只增不减"（loss≈0 且 add>0），说明是同一页在往下加内容/播动画，
@@ -1133,7 +1133,9 @@ def dedupe(S, cands, verbose=False):
     不会被当成一页。
     """
     keep, why = [], []
-    for i, c in enumerate(cands):
+    order = list(only) if only is not None else range(len(cands))
+    for i in order:
+        c = cands[i]
         if not keep:
             keep.append(i)
             continue
@@ -1675,16 +1677,32 @@ def apply_bg(ffmpeg, video, crop, png_list, target, tol,
 # --------------------------------------------------------------------------- #
 # AI 辅助（可选）：把"空白页 / 转场中间态 / 重复页"的判断交给模型
 # --------------------------------------------------------------------------- #
-AI_PROMPT = """你是课件视频还原助手。下面是从课件视频里抽出的候选页面（按时间排序）。
+AI_PROMPT = """你是课件视频还原助手。下面是从课件视频里抽出的候选画面（按时间排序）。
+我们最终要产出一个"干净的课件 PDF"，所以每帧只需回答一件事：
+**这一帧能不能直接当作一页课件放进 PDF？**
 
-逐张判断后，**只输出一个 JSON 数组**，不要解释、不要 markdown 代码块：
-[{"i": 0, "keep": true, "reason": "完整课件页"}, {"i": 1, "keep": false, "reason": "擦除转场半途，右侧纯白"}]
+逐张判断，**只输出一个 JSON 数组**，不要解释、不要 markdown 代码块：
+[{"i": 0, "keep": true, "type": "slide", "reason": "完整放映页"},
+ {"i": 1, "keep": false, "type": "editor", "reason": "PPT 编辑态：左侧缩略图窗格 + 顶部功能区"}]
 
-判据：
-- keep=false：① 整页空白或纯黑；② 转场中间态（擦除/推入/百叶窗/淡出到白的半途，
-  特征是整条整条的纯白带）；③ 与前面某页几乎相同、只是"少了几行/少了个图"的不完整版本
-  （这种情况只保留内容最全的那张）。
-- keep=true：正常、内容完整的课件页（哪怕字很少、很空，只要不是上面三种）。
+丢弃（keep=false）的 5 类，type 用括号里的英文：
+1. （blank）整页空白 / 近空白 / 纯黑 / 只剩一条标题栏。
+2. （transition）转场中间态：擦除、推入、百叶窗、淡出到白、叠影（两张半透明叠在一起），
+   特征是整条整条的纯白带、条纹、或明显的重影。
+3. （editor）**软件界面**：画面里能看到 PowerPoint / WPS / 播放器的操作界面 ——
+   顶部功能区(ribbon)、左侧幻灯片缩略图窗格、底部状态栏、窗口标题栏、任务栏、
+   桌面图标、鼠标光标、播放控制条、批注/会议侧栏。
+   判据：幻灯片内容**没有铺满整个画面**，四周或某侧露出软件界面。
+4. （partial）同一页的"不完整版"：后面还有一张同页但内容更全（多了几行字/多了图），
+   这种情况只保留内容最全的那张。
+5. （dup）与前面某一帧几乎完全相同（同一页的重复停留）。
+
+保留（keep=true）的只有一类：
+- （slide）纯幻灯片画面：整页铺满、没有软件界面、没有转场痕迹、内容完整。
+
+特别注意：如果同一页既有"编辑态/带界面"的一帧，又有"放映态/纯净"的一帧，
+**保留放映态、丢弃编辑态**（我们要的是放映态）。
+
 一共 NIMG 张，索引 0…NIMG-1，必须每张都给一个结论。"""
 
 
@@ -1872,11 +1890,13 @@ def ai_decide(ai_dir, cands, small, endpoint, key, model, batch=8):
             if 0 <= i < n:
                 dec[i] = bool(e.get("keep", True))
                 if dec[i]:
-                    log("  AI 保留 #%d %s：%s"
-                        % (i, tc(cands[i]["t"]), str(e.get("reason", ""))[:60]))
+                    log("  AI 保留 #%d %s [%s] %s"
+                        % (i, tc(cands[i]["t"]), str(e.get("type", "?")),
+                           str(e.get("reason", ""))[:58]))
                 else:
-                    log("  AI 丢弃 #%d %s：%s"
-                        % (i, tc(cands[i]["t"]), str(e.get("reason", ""))[:80]))
+                    log("  AI 丢弃 #%d %s [%s] %s"
+                        % (i, tc(cands[i]["t"]), str(e.get("type", "?")),
+                           str(e.get("reason", ""))[:58]))
         for i in idx:
             dec.setdefault(i, True)
         bar.update(min(n, s0 + batch))
@@ -2289,12 +2309,44 @@ def main(argv=None):
                     % (len(pngs), len(cands)))
 
         n0 = len(pngs)
-        keep = list(range(n0)) if not dedupe_on else dedupe(S, cands, True)
-
         ai_on = (a.ai != "off")
-        # 转场中间态安全网：去重之后再剔（不改变去重的比较顺序，结果才稳定）
+
+        # ---------- AI 辅助（可选）：先看全部候选，再去重 ----------
+        # 顺序很关键：同一页的"编辑态"和"放映态"是两张图，必须都交给 AI 才能挑出放映态。
+        # 若先跑 dedupe，编辑态可能把放映态合并掉，AI 再丢掉编辑态 → 整页丢失。
+        dec = None
+        if ai_on or a.ai_apply:
+            stem = re.sub(r"\.pdf$", "", os.path.basename(out))
+            ai_dir = os.path.join(os.path.dirname(out) or ".", stem + ".ai")
+            if ai_on:
+                ai_export(ai_dir, cands, list(range(n0)), pngs, S,
+                          dict(video=os.path.basename(a.video), pages=n0))
+                log("  AI 清单：%s（%d 张候选页 + manifest.json + prompt.md）"
+                    % (ai_dir, n0))
+            if a.ai == "api":
+                cfg = resolve_ai(a.ai_provider, a.ai_endpoint, a.ai_model, a.ai_key)
+                log("  AI：%s（%s）" % (cfg["name"], cfg["provider"]))
+                if not cfg["vision"]:
+                    log("  ⚠ %s 标称无视觉模型，判图可能失败；建议 glm/qwen/gemini"
+                        % cfg["name"])
+                dec = ai_decide(ai_dir, cands, S, cfg["endpoint"], cfg["key"],
+                                cfg["model"], a.ai_batch)
+            elif a.ai_apply:
+                dec = load_decisions(a.ai_apply)
+                log("  按 %s 过滤页面…" % a.ai_apply)
+
+        if dec is not None:
+            base = [k for k in range(n0) if dec.get(k, True)]
+            log("  AI/人工决定：%d → %d 帧保留（丢弃 %d）"
+                % (n0, len(base), n0 - len(base)))
+        else:
+            base = list(range(n0))
+
+        keep = dedupe(S, cands, True, only=base) if dedupe_on else base
+
+        # 转场中间态安全网（像素规则；AI 模式下交给模型判断）
         if ai_on:
-            log("  AI 模式：不再用像素规则丢“空白页/转场中间态”，全部候选交给 AI 判断")
+            log("  AI 模式：不再用像素规则丢“空白页/转场中间态”")
         elif not a.keep_wipe:
             kept = []
             for k in keep:
@@ -2309,33 +2361,6 @@ def main(argv=None):
                         % (tc(cands[k]["t"]), hc * 100, a.wipe_h))
                 kept.append(k)
             keep = kept
-
-        # ---------- AI 辅助（可选）----------
-        if ai_on or a.ai_apply:
-            stem = re.sub(r"\.pdf$", "", os.path.basename(out))
-            ai_dir = os.path.join(os.path.dirname(out) or ".", stem + ".ai")
-            if ai_on:
-                ai_export(ai_dir, cands, keep, pngs, S,
-                          dict(video=os.path.basename(a.video), pages=n0))
-                log("  AI 清单：%s（%d 张候选页 + manifest.json + prompt.md）"
-                    % (ai_dir, n0))
-            dec = None
-            if a.ai == "api":
-                cfg = resolve_ai(a.ai_provider, a.ai_endpoint, a.ai_model, a.ai_key)
-                log("  AI：%s（%s）" % (cfg["name"], cfg["provider"]))
-                if not cfg["vision"]:
-                    log("  ⚠ %s 目前没有视觉模型，判图大概率失败；建议 glm/qwen/gemini"
-                        % cfg["name"])
-                dec = ai_decide(ai_dir, cands, S, cfg["endpoint"], cfg["key"],
-                                cfg["model"], a.ai_batch)
-            elif a.ai_apply:
-                dec = load_decisions(a.ai_apply)
-                log("  按 %s 过滤页面…" % a.ai_apply)
-            if dec is not None:
-                before = len(keep)
-                keep = [k for k in keep if dec.get(k, True)]
-                log("  AI/人工决定：%d → %d 页（丢弃 %d）"
-                    % (before, len(keep), before - len(keep)))
 
         # ---------- 背景统一（可选）----------
         target = parse_color(a.bg_color) if a.bg_color else None
