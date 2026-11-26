@@ -1563,13 +1563,17 @@ def _png_chunk(tag, data):
 
 
 def _png_bytes(w, h, buf, channels=3):
-    """把行优先的裸像素打成一个最小 PNG（filter 0/行，zlib 压缩）。"""
-    stride = w * channels
+    """把行优先的裸像素打成一个最小 PNG（filter 0/行，zlib 压缩）。
+
+    channels: 3=RGB（color type 2）；1 或 0=灰度（color type 0，每像素 1 字节）。
+    """
+    ch = 3 if channels == 3 else 1
+    stride = w * ch
     raw = bytearray()
     for y in range(h):
         raw.append(0)
         raw += buf[y * stride:(y + 1) * stride]
-    ctype = 2 if channels == 3 else 0
+    ctype = 2 if ch == 3 else 0
     ihdr = struct.pack(">IIBBBBB", w, h, 8, ctype, 0, 0, 0)
     return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
             + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
@@ -1696,7 +1700,7 @@ AI_PROVIDERS = {
                "https://generativelanguage.googleapis.com/v1beta/openai",
                "gemini-2.0-flash", ("GEMINI_API_KEY", "GOOGLE_API_KEY"), True),
     "deepseek": ("DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat",
-                 ("DEEPSEEK_API_KEY",), False),
+                 ("DEEPSEEK_API_KEY",), True),
     "ollama": ("本地 Ollama", "http://127.0.0.1:11434/v1", "qwen2.5vl:7b", (), True),
 }
 
@@ -1797,11 +1801,13 @@ def ai_export(ai_dir, cands, keep, pngs, small=None, meta=None):
     return ai_dir, len(rows)
 
 
-def _ai_request(endpoint, key, model, images, timeout=180):
+def _ai_request(endpoint, key, model, images, timeout=180, strict=None):
     """POST 一个 OpenAI 兼容的 /chat/completions，返回模型吐出的文本。"""
     import urllib.request
-    content = [{"type": "text",
-                "text": AI_PROMPT.replace("NIMG", str(len(images)))}]
+    txt = AI_PROMPT.replace("NIMG", str(len(images)))
+    if strict:
+        txt = txt + "\n\n" + strict
+    content = [{"type": "text", "text": txt}]
     for b64 in images:
         content.append({"type": "image_url",
                         "image_url": {"url": "data:image/png;base64," + b64}})
@@ -1850,6 +1856,14 @@ def ai_decide(ai_dir, cands, small, endpoint, key, model, batch=8):
         imgs = [_b64_png(SW, SH, bytes(np.asarray(small[i]).tobytes()), 0) for i in idx]
         txt = _ai_request(endpoint, key, model, imgs)
         got = _parse_ai_json(txt)
+        if not got and n:
+            # 有些模型爱先讲一段理由再给 JSON，甚至干脆不给 —— 追问一次
+            txt2 = _ai_request(endpoint, key, model, imgs,
+                               strict="只输出 JSON 数组，不要任何解释文字、不要代码围栏。")
+            got = _parse_ai_json(txt2)
+            if not got:
+                log("  提示：模型两次都没给出 JSON，这批按 keep 处理（%s）"
+                    % txt.strip().replace("\n", " ")[:80])
         for e in got:
             try:
                 i = int(e.get("i"))
@@ -1857,7 +1871,10 @@ def ai_decide(ai_dir, cands, small, endpoint, key, model, batch=8):
                 continue
             if 0 <= i < n:
                 dec[i] = bool(e.get("keep", True))
-                if not dec[i]:
+                if dec[i]:
+                    log("  AI 保留 #%d %s：%s"
+                        % (i, tc(cands[i]["t"]), str(e.get("reason", ""))[:60]))
+                else:
                     log("  AI 丢弃 #%d %s：%s"
                         % (i, tc(cands[i]["t"]), str(e.get("reason", ""))[:80]))
         for i in idx:
@@ -1870,25 +1887,51 @@ def ai_decide(ai_dir, cands, small, endpoint, key, model, batch=8):
     return dec
 
 
+def _scan_json(t, open_ch, close_ch):
+    """从 t 里扫出第一个括号配平的片段（跳过字符串内的括号）。"""
+    i = t.find(open_ch)
+    while i >= 0:
+        depth, j, in_str, esc = 0, i, False, False
+        while j < len(t):
+            c = t[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == open_ch:
+                depth += 1
+            elif c == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return t[i:j + 1]
+            j += 1
+        i = t.find(open_ch, i + 1)
+    return None
+
+
 def _parse_ai_json(txt):
-    t = txt.strip()
-    t = re.sub(r"^```(?:json)?|```$", "", t, flags=re.M).strip()
-    a, b = t.find("["), t.rfind("]")
-    if a >= 0 and b > a:
+    """从模型回复里抠出 JSON（容忍 ``` 围栏、前后解释、内部字符串含括号）。"""
+    t = (txt or "").strip()
+    t = re.sub(r"```(?:json)?", "", t).strip()
+    for chunk in (t, _scan_json(t, "[", "]"), _scan_json(t, "{", "}")):
+        if not chunk:
+            continue
         try:
-            v = json.loads(t[a:b + 1])
-            return v if isinstance(v, list) else []
+            v = json.loads(chunk)
         except ValueError:
-            pass
-    a, b = t.find("{"), t.rfind("}")
-    if a >= 0 and b > a:
-        try:
-            v = json.loads(t[a:b + 1])
-            if isinstance(v, dict) and "pages" in v:
+            continue
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            if isinstance(v.get("pages"), list):
                 return v["pages"]
-        except ValueError:
-            pass
-    log("  警告：模型返回的不是合法 JSON，这一批全部按 keep 处理")
+            if "keep" in v:                 # 单个对象也认
+                return [v]
     return []
 
 
