@@ -1684,6 +1684,78 @@ AI_PROMPT = """你是课件视频还原助手。下面是从课件视频里抽�
 一共 NIMG 张，索引 0…NIMG-1，必须每张都给一个结论。"""
 
 
+AI_PROVIDERS = {
+    # key: (显示名, base url, 默认模型, 该家常用的环境变量名, 是否有视觉模型)
+    "openai": ("ChatGPT / OpenAI", "https://api.openai.com/v1", "gpt-4o-mini",
+               ("OPENAI_API_KEY",), True),
+    "glm": ("智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-4v-flash",
+            ("ZHIPU_API_KEY", "GLM_API_KEY", "BIGMODEL_API_KEY"), True),
+    "qwen": ("阿里百炼 通义千问", "https://dashscope.aliyuncs.com/compatible-mode/v1",
+             "qwen-vl-max", ("DASHSCOPE_API_KEY", "QWEN_API_KEY"), True),
+    "gemini": ("Google Gemini",
+               "https://generativelanguage.googleapis.com/v1beta/openai",
+               "gemini-2.0-flash", ("GEMINI_API_KEY", "GOOGLE_API_KEY"), True),
+    "deepseek": ("DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat",
+                 ("DEEPSEEK_API_KEY",), False),
+    "ollama": ("本地 Ollama", "http://127.0.0.1:11434/v1", "qwen2.5vl:7b", (), True),
+}
+
+AI_MODEL_HINTS = [
+    (r"^(gpt|o1|o3|o4|chatgpt)", "openai"),
+    (r"^glm", "glm"),
+    (r"^(qwen|qwq|qwen2|tongyi)", "qwen"),
+    (r"^gemini", "gemini"),
+    (r"^deepseek", "deepseek"),
+]
+
+
+def infer_provider(model):
+    m = (model or "").strip().lower()
+    for pat, prov in AI_MODEL_HINTS:
+        if re.match(pat, m):
+            return prov
+    return ""
+
+
+def ai_list():
+    log("内置服务（只填 key + 模型名即可，地址自动选）：")
+    for k, (name, url, mdl, envs, vis) in AI_PROVIDERS.items():
+        log("  %-9s %-18s %s" % (k, name, url))
+        log("            %-18s 模型示例：%s%s"
+            % ("", mdl, "" if vis else "  ← 无视觉模型，判图用不了"))
+        if envs:
+            log("            %-18s 环境变量：%s" % ("", " / ".join(envs)))
+    log("")
+    log("用法：python slide2pdf.py 视频.mp4 --ai api --ai-model qwen-vl-max")
+    log("      再配一个密钥：--ai-key sk-xxx 或环境变量 DASHSCOPE_API_KEY")
+
+
+def resolve_ai(provider=None, endpoint=None, model=None, key=None):
+    """把 provider/model/endpoint/key 归一化：只给模型名也能自动挑对地址。"""
+    ep_env = os.environ.get("SLIDE2PDF_AI_ENDPOINT")
+    md_env = os.environ.get("SLIDE2PDF_AI_MODEL")
+    mp = (model or md_env or "").strip()
+    prov = (provider or "").strip().lower()
+    if prov in ("", "auto"):
+        prov = infer_provider(mp) or "openai"
+    if prov not in AI_PROVIDERS:
+        raise SystemExit("不认识的服务：%s（可选：%s，或用 --ai-endpoint 自己给地址）"
+                         % (prov, " / ".join(AI_PROVIDERS)))
+    name, url, dflt_model, envs, vis = AI_PROVIDERS[prov]
+    ep = endpoint or ep_env or url
+    mdl = mp or dflt_model
+    k = key or os.environ.get("SLIDE2PDF_AI_KEY")
+    if not k:
+        for e in envs:
+            if os.environ.get(e):
+                k = os.environ[e]
+                break
+    if not k and os.environ.get("OPENAI_API_KEY"):
+        k = os.environ["OPENAI_API_KEY"]
+    return dict(provider=prov, name=name, endpoint=ep, model=mdl, key=k,
+                vision=vis)
+
+
 def _b64_png(w, h, buf, channels=0):
     import base64
     return base64.b64encode(_png_bytes(w, h, buf, channels)).decode("ascii")
@@ -1971,15 +2043,20 @@ def main(argv=None):
                     help="AI 辅助判页：off=不用（默认）；export=只导出候选页+清单+提示词，"
                          "等你自己交给模型；api=直接调用视觉模型判定。"
                          "开启后**不再**用像素规则丢空白页/转场页，判断权交给 AI")
+    g5.add_argument("--ai-provider", metavar="NAME", default="auto",
+                    help="内置服务：auto（按模型名自动识别）/ openai / glm / qwen / "
+                         "gemini / deepseek / ollama。只填模型名就够了")
+    g5.add_argument("--ai-list", action="store_true",
+                    help="列出内置服务（地址 + 默认模型 + 该用的环境变量名）")
     g5.add_argument("--ai-endpoint", metavar="URL",
-                    default=os.environ.get("SLIDE2PDF_AI_ENDPOINT",
-                                           "https://api.openai.com/v1"),
-                    help="OpenAI 兼容的 base url，默认 https://api.openai.com/v1")
+                    help="自定义 base url（不给就按 --ai-provider 自动选）")
     g5.add_argument("--ai-model", metavar="NAME",
-                    default=os.environ.get("SLIDE2PDF_AI_MODEL", "gpt-4o-mini"),
-                    help="模型名，默认 gpt-4o-mini")
+                    help="模型名（如 qwen-vl-max / glm-4v-flash / gpt-4o-mini / "
+                         "gemini-2.0-flash）；地址会按模型名自动选")
     g5.add_argument("--ai-key", metavar="KEY",
-                    help="API key；也可用环境变量 SLIDE2PDF_AI_KEY / OPENAI_API_KEY")
+                    help="API key；也可用环境变量 SLIDE2PDF_AI_KEY，或各家自己的"
+                         "（DASHSCOPE_API_KEY / ZHIPU_API_KEY / GEMINI_API_KEY / "
+                         "DEEPSEEK_API_KEY / OPENAI_API_KEY）")
     g5.add_argument("--ai-batch", type=int, default=8, metavar="N",
                     help="每次请求发几张图，默认 8")
     g5.add_argument("--ai-test", action="store_true",
@@ -1999,13 +2076,18 @@ def main(argv=None):
     BAR_LIB = a.bar
     DOWNLOAD_POLICY = a.download
     ASSUME_YES = bool(getattr(a, "yes", False))
+    if getattr(a, "ai_list", False):
+        ai_list()
+        return 0
+
     if getattr(a, "ai_test", False):
-        key = (a.ai_key or os.environ.get("SLIDE2PDF_AI_KEY")
-               or os.environ.get("OPENAI_API_KEY"))
-        if not key:
-            log("⚠ 没有密钥：可以用 --ai-key 直接给，或设环境变量 "
-                "SLIDE2PDF_AI_KEY / OPENAI_API_KEY")
-        return ai_test(a.ai_endpoint, key, a.ai_model)
+        cfg = resolve_ai(a.ai_provider, a.ai_endpoint, a.ai_model, a.ai_key)
+        log("服务：%s（provider=%s）" % (cfg["name"], cfg["provider"]))
+        if not cfg["vision"]:
+            log("⚠ 这一家的模型目前是纯文本的，判图会失败；推荐 glm / qwen / gemini / ollama")
+        if not cfg["key"]:
+            log("⚠ 没有密钥：用 --ai-key，或设环境变量（见 --ai-list）")
+        return ai_test(cfg["endpoint"], cfg["key"], cfg["model"])
 
     if a.doctor:                                 # 只做自检，不需要视频
         doctor(a.ffmpeg, a.ffprobe)
@@ -2196,10 +2278,13 @@ def main(argv=None):
                     % (ai_dir, n0))
             dec = None
             if a.ai == "api":
-                key = (a.ai_key or os.environ.get("SLIDE2PDF_AI_KEY")
-                       or os.environ.get("OPENAI_API_KEY"))
-                dec = ai_decide(ai_dir, cands, S, a.ai_endpoint, key,
-                                a.ai_model, a.ai_batch)
+                cfg = resolve_ai(a.ai_provider, a.ai_endpoint, a.ai_model, a.ai_key)
+                log("  AI：%s（%s）" % (cfg["name"], cfg["provider"]))
+                if not cfg["vision"]:
+                    log("  ⚠ %s 目前没有视觉模型，判图大概率失败；建议 glm/qwen/gemini"
+                        % cfg["name"])
+                dec = ai_decide(ai_dir, cands, S, cfg["endpoint"], cfg["key"],
+                                cfg["model"], a.ai_batch)
             elif a.ai_apply:
                 dec = load_decisions(a.ai_apply)
                 log("  按 %s 过滤页面…" % a.ai_apply)
