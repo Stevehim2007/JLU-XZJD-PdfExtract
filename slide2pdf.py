@@ -32,12 +32,14 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 import zipfile
+import zlib
 import unicodedata
 
 import numpy as np
@@ -67,6 +69,7 @@ EXAMPLES = """\
 
 GW, GH = 80, 60          # 指纹网格
 SW, SH = 480, 360        # 去重网格
+VERSION = "1.5"          # 工具版本（写进 manifest/README）
 DIFF = 20                # 单像素"变化"的灰度阈值
 
 
@@ -763,7 +766,8 @@ def fingerprint(ffmpeg, path, crop, fps, tmp, start=0.0, dur=None):
 
 
 def analyse(A, fps, thr, min_hold, mask_anim, keep_motion,
-            drop_blank=True, max_gap=2, lag=2):
+            drop_blank=True, max_gap=2, lag=2,
+            ink_thr=200, blank_lo=0.6, blank_hi=99.0):
     F = A.shape[0]
     D = np.empty((F - 1, GH, GW), dtype=bool)
     for i in range(0, F - 1, 512):
@@ -775,7 +779,7 @@ def analyse(A, fps, thr, min_hold, mask_anim, keep_motion,
     if mask.sum() < 0.3 * mask.size:        # 动图占太多，全画幅算
         mask = np.ones_like(mask)
     chg = D2[:, mask].mean(1)
-    ink = (A.reshape(F, -1) < 200).mean(1)
+    ink = (A.reshape(F, -1) < ink_thr).mean(1)
 
     hot = np.where(chg > thr)[0]
     blocks = []
@@ -819,9 +823,10 @@ def analyse(A, fps, thr, min_hold, mask_anim, keep_motion,
         mid = (s + e - 1) / 2.0
         pick = min(good, key=lambda i: (abs(i - mid), -ink[i]))
         iv = float(ink[pick]) * 100
-        if drop_blank and (iv < 0.6 or iv > 99.0):
+        if drop_blank and (iv < blank_lo or iv > blank_hi):
             dropped.append(dict(kind="blank", s=s, e=e, n=ln, ink=iv,
-                                why="整页空白/纯黑（ink=%.1f%%），不是有效课件页" % iv))
+                                why="整页空白/纯黑（ink=%.1f%%，判据 %.1f~%.1f%%，"
+                                    "可用 --blank-ink 调整）" % (iv, blank_lo, blank_hi)))
             continue
         cands.append(dict(frame=pick, s=s / fps, e=e / fps, t=pick / fps,
                           dwell=ln / fps, ink=iv, conf=conf,
@@ -1092,14 +1097,15 @@ def extract(ffmpeg, path, crop, fps, frames, outdir, pred=True,
 # --------------------------------------------------------------------------- #
 # 去重
 # --------------------------------------------------------------------------- #
-def wipe_metrics(a):
+def wipe_metrics(a, ink_thr=200, band_ink=0.002):
     """返回 (竖白带占比, 横白带占比)：最长的一段"几乎没墨"的行/列。
 
     用于识别擦除/百叶窗/推入这类**转场中间态**：它们的特征是整条整条的空行列
     （比如从右往左推进时，右半边是纯白），而正常课件页很少出现 >45% 的整条空白带。
+    ink_thr = "有墨"的灰度上界；band_ink = 一行/列里墨量低于该比例即算"空"。
     """
-    ink = (a < 200)
-    def longest(profile, total, thr=0.002):
+    ink = (a < ink_thr)
+    def longest(profile, total, thr=band_ink):
         best = cur = 0
         for v in profile:
             cur = cur + 1 if v < thr else 0
@@ -1509,6 +1515,304 @@ def merge_pdfs(paths, out, engine="auto"):
                          "可 pip install pymupdf 后去掉 --merge-raw 再试" % e)
 
 
+
+# --------------------------------------------------------------------------- #
+# 背景统一（可选）：把课件底色换成指定颜色
+# --------------------------------------------------------------------------- #
+COLOR_NAMES = {
+    "white": (255, 255, 255), "black": (0, 0, 0), "gray": (128, 128, 128),
+    "grey": (128, 128, 128), "lightgray": (235, 235, 235), "silver": (192, 192, 192),
+    "ivory": (255, 255, 240), "beige": (245, 245, 220), "paper": (250, 248, 240),
+    "blue": (225, 237, 250), "green": (228, 244, 228), "yellow": (255, 250, 225),
+    "白": (255, 255, 255), "黑": (0, 0, 0), "灰": (128, 128, 128),
+    "浅灰": (235, 235, 235), "米白": (245, 245, 225), "纸白": (250, 248, 240),
+    "淡蓝": (225, 237, 250), "淡绿": (228, 244, 228), "淡黄": (255, 250, 225),
+}
+
+
+def parse_color(s):
+    """`#RRGGBB` / `#RGB` / `rgb(1,2,3)` / 常用色名 -> (r,g,b)；off/none -> None。"""
+    if not s:
+        return None
+    t = str(s).strip().lower()
+    if t in ("off", "none", "auto", "keep", "no"):
+        return None
+    if t in COLOR_NAMES:
+        return COLOR_NAMES[t]
+    if t.startswith("#"):
+        h = t[1:]
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        if len(h) == 6:
+            try:
+                return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+            except ValueError:
+                pass
+    m = re.match(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", t)
+    if m:
+        return tuple(min(255, int(x)) for x in m.groups())
+    raise SystemExit("看不懂的颜色：%r\n"
+                     "  可用：#RRGGBB（如 #ffffff）、#RGB、rgb(255,255,255)、"
+                     "常用色名（白/黑/灰/浅灰/米白/纸白/淡蓝/淡绿/淡黄，"
+                     "或 white/black/paper/ivory…）" % s)
+
+
+def _png_chunk(tag, data):
+    return (struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+
+def _png_bytes(w, h, buf, channels=3):
+    """把行优先的裸像素打成一个最小 PNG（filter 0/行，zlib 压缩）。"""
+    stride = w * channels
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        raw += buf[y * stride:(y + 1) * stride]
+    ctype = 2 if channels == 3 else 0
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, ctype, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
+            + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+            + _png_chunk(b"IEND", b""))
+
+
+def png_write(path, w, h, buf, channels=3):
+    with open(path, "wb") as fh:
+        fh.write(_png_bytes(w, h, buf, channels))
+
+
+def estimate_bg(a, light_min=170):
+    """估计这一页的底色：只在"浅色像素"里取众数，避免把照片/深色块当底色。
+
+    返回 (r,g,b)；整页都很暗（没有浅色像素）时返回 None（跳过，不改）。
+    """
+    light = (a.min(axis=2) >= light_min)
+    if light.mean() < 0.02:
+        return None
+    px = a[light]
+    q = (px >> 4).astype(np.int32)
+    key = (q[:, 0] << 8) | (q[:, 1] << 4) | q[:, 2]
+    hist = np.bincount(key, minlength=4096)
+    b = int(hist.argmax())
+    sel = px[key == b]
+    if len(sel) == 0:
+        return None
+    return tuple(int(v) for v in sel.mean(axis=0))
+
+
+def recolor(a, bg, target, tol):
+    """把"接近底色 bg（容差 tol）"的像素换成 target，其它像素不动。"""
+    d = np.abs(a.astype(np.int16) - np.array(bg, dtype=np.int16)).max(axis=2)
+    out = a.copy()
+    out[d <= tol] = np.array(target, dtype=np.uint8)
+    return out
+
+
+def apply_bg(ffmpeg, video, crop, png_list, target, tol,
+             vf_prefix=None, times=None, start=0.0):
+    """把 png_list 里每张图的底色统一成 target（就地重写 PNG）。"""
+    cw, ch, cx, cy = crop
+    fb = cw * ch * 3
+    ok = [0]
+
+    def one(buf, png):
+        a = np.frombuffer(buf, np.uint8).reshape(ch, cw, 3)
+        bg = estimate_bg(a)
+        if bg is None:
+            log("  跳过 %s（没有明显浅色底色，可能是照片页）"
+                % os.path.basename(png))
+            return
+        png_write(png, cw, ch,
+                  np.ascontiguousarray(recolor(a, bg, target, tol)).tobytes(), 3)
+        ok[0] += 1
+
+    if vf_prefix:
+        cmd = [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-v", "error",
+               "-ss", "%.3f" % start, "-i", video, "-an", "-sn",
+               "-vf", vf_prefix + ",format=rgb24",
+               "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, bufsize=fb * 4)
+        bar = Bar(len(png_list), "  背景统一")
+        try:
+            for k, png in enumerate(png_list):
+                buf = p.stdout.read(fb)
+                if not buf or len(buf) < fb:
+                    break
+                one(buf, png)
+                bar.update(k + 1)
+        finally:
+            p.stdout.close()
+            err = p.stderr.read().decode("utf-8", "replace")
+            p.stderr.close()
+            rc = p.wait()
+            bar.done()
+        if ok[0] == len(png_list):
+            return ok[0]
+        if rc != 0:
+            log("  一次性重取失败（rc=%d）：%s" % (rc, err.strip()[:300]))
+        log("  改为逐帧重取（%d 页）…" % len(png_list))
+
+    bar = Bar(len(png_list), "  背景统一")
+    for k, png in enumerate(png_list):
+        t = float(times[k]) if times else 0.0
+        cmd = [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-v", "error",
+               "-ss", "%.3f" % t, "-i", video, "-an", "-sn",
+               "-vf", "crop=%d:%d:%d:%d,format=rgb24" % (cw, ch, cx, cy),
+               "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if len(r.stdout) >= fb:
+            one(r.stdout[:fb], png)
+        bar.update(k + 1)
+    bar.done()
+    return ok[0]
+
+
+# --------------------------------------------------------------------------- #
+# AI 辅助（可选）：把"空白页 / 转场中间态 / 重复页"的判断交给模型
+# --------------------------------------------------------------------------- #
+AI_PROMPT = """你是课件视频还原助手。下面是从课件视频里抽出的候选页面（按时间排序）。
+
+逐张判断后，**只输出一个 JSON 数组**，不要解释、不要 markdown 代码块：
+[{"i": 0, "keep": true, "reason": "完整课件页"}, {"i": 1, "keep": false, "reason": "擦除转场半途，右侧纯白"}]
+
+判据：
+- keep=false：① 整页空白或纯黑；② 转场中间态（擦除/推入/百叶窗/淡出到白的半途，
+  特征是整条整条的纯白带）；③ 与前面某页几乎相同、只是"少了几行/少了个图"的不完整版本
+  （这种情况只保留内容最全的那张）。
+- keep=true：正常、内容完整的课件页（哪怕字很少、很空，只要不是上面三种）。
+一共 NIMG 张，索引 0…NIMG-1，必须每张都给一个结论。"""
+
+
+def _b64_png(w, h, buf, channels=0):
+    import base64
+    return base64.b64encode(_png_bytes(w, h, buf, channels)).decode("ascii")
+
+
+def ai_export(ai_dir, cands, keep, pngs, small=None, meta=None):
+    """把候选页 + 清单 + 提示词写到磁盘，方便交给任何视觉模型（或人工）判断。"""
+    pages_dir = os.path.join(ai_dir, "pages")
+    os.makedirs(pages_dir, exist_ok=True)
+    rows = []
+    for i, (c, png) in enumerate(zip(cands, pngs)):
+        dst = os.path.join(pages_dir, "%04d.png" % i)
+        shutil.copyfile(png, dst)
+        vc = hc = None
+        if small is not None:
+            vc, hc = wipe_metrics(np.asarray(small[i]))
+        rows.append(dict(
+            i=i, png="pages/%04d.png" % i,
+            t="%.2f" % c["t"], timecode=tc(c["t"]),
+            dwell_s="%.1f" % c["dwell"], ink_pct="%.2f" % c["ink"],
+            wipe_v="%.3f" % vc if vc is not None else None,
+            wipe_h="%.3f" % hc if hc is not None else None,
+            in_pdf=bool(i in set(keep)), keep=None))
+    man = dict(tool="slide2pdf", version=VERSION, generated=time.strftime("%Y-%m-%d %H:%M:%S"),
+               meta=meta or {}, count=len(rows), pages=rows)
+    with open(os.path.join(ai_dir, "manifest.json"), "w") as fh:
+        json.dump(man, fh, ensure_ascii=False, indent=1)
+    with open(os.path.join(ai_dir, "prompt.md"), "w") as fh:
+        fh.write("# 交给视觉模型的提示词\n\n把 `pages/` 里的图片按顺序一起发给模型，"
+                 "提示词如下（把 NIMG 换成张数）：\n\n```\n%s\n```\n\n"
+                 "拿回 JSON 后存成 `decisions.json`，再运行：\n\n```bash\n"
+                 "python slide2pdf.py \"视频.mp4\" --ai-apply decisions.json\n```\n\n"
+                 "`decisions.json` 可以是 `{\"pages\":[{\"i\":0,\"keep\":true},…]}`，"
+                 "也可以直接是 `[{\"i\":0,\"keep\":true},…]`。\n"
+                 % AI_PROMPT.replace("NIMG", str(len(rows))))
+    with open(os.path.join(ai_dir, "decisions.example.json"), "w") as fh:
+        json.dump(dict(pages=[dict(i=r["i"], keep=True, reason="完整课件页")
+                             for r in rows[:3]]), fh, ensure_ascii=False, indent=1)
+    return ai_dir, len(rows)
+
+
+def _ai_request(endpoint, key, model, images, timeout=180):
+    """POST 一个 OpenAI 兼容的 /chat/completions，返回模型吐出的文本。"""
+    import urllib.request
+    content = [{"type": "text",
+                "text": AI_PROMPT.replace("NIMG", str(len(images)))}]
+    for b64 in images:
+        content.append({"type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + b64}})
+    body = json.dumps(dict(model=model, temperature=0, max_tokens=2048,
+                           messages=[dict(role="user", content=content)]))
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + "/chat/completions",
+        data=body.encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + key})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    return data["choices"][0]["message"]["content"]
+
+
+def ai_decide(ai_dir, cands, small, endpoint, key, model, batch=8):
+    """让模型逐批判定，返回 {候选索引: keep(bool)}。"""
+    dec = {}
+    n = len(cands)
+    if not key:
+        raise SystemExit("--ai api 需要密钥：--ai-key 或环境变量 "
+                         "SLIDE2PDF_AI_KEY / OPENAI_API_KEY")
+    bar = Bar(n, "  AI 判定")
+    for s0 in range(0, n, batch):
+        idx = list(range(s0, min(n, s0 + batch)))
+        imgs = [_b64_png(SW, SH, bytes(np.asarray(small[i]).tobytes()), 0) for i in idx]
+        txt = _ai_request(endpoint, key, model, imgs)
+        got = _parse_ai_json(txt)
+        for e in got:
+            try:
+                i = int(e.get("i"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= i < n:
+                dec[i] = bool(e.get("keep", True))
+                if not dec[i]:
+                    log("  AI 丢弃 #%d %s：%s"
+                        % (i, tc(cands[i]["t"]), str(e.get("reason", ""))[:80]))
+        for i in idx:
+            dec.setdefault(i, True)
+        bar.update(min(n, s0 + batch))
+    bar.done()
+    with open(os.path.join(ai_dir, "decisions.json"), "w") as fh:
+        json.dump(dict(pages=[dict(i=i, keep=dec.get(i, True)) for i in range(n)]),
+                  fh, ensure_ascii=False, indent=1)
+    return dec
+
+
+def _parse_ai_json(txt):
+    t = txt.strip()
+    t = re.sub(r"^```(?:json)?|```$", "", t, flags=re.M).strip()
+    a, b = t.find("["), t.rfind("]")
+    if a >= 0 and b > a:
+        try:
+            v = json.loads(t[a:b + 1])
+            return v if isinstance(v, list) else []
+        except ValueError:
+            pass
+    a, b = t.find("{"), t.rfind("}")
+    if a >= 0 and b > a:
+        try:
+            v = json.loads(t[a:b + 1])
+            if isinstance(v, dict) and "pages" in v:
+                return v["pages"]
+        except ValueError:
+            pass
+    log("  警告：模型返回的不是合法 JSON，这一批全部按 keep 处理")
+    return []
+
+
+def load_decisions(path):
+    """读 decisions.json -> {候选索引: keep(bool)}"""
+    d = json.load(open(path))
+    rows = d.get("pages") if isinstance(d, dict) else d
+    out = {}
+    for e in rows or []:
+        try:
+            out[int(e.get("i"))] = bool(e.get("keep", True))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="把课件录屏视频还原成 PDF（静止换页检测 + 无损位图合成）",
@@ -1555,6 +1859,15 @@ def main(argv=None):
                     help="保留空白/黑屏页")
     g3.add_argument("--keep-wipe", action="store_true",
                     help="保留擦除/百叶窗等转场中间态（默认剔除：它们看着像内容不全/被白块盖住）")
+    g3.add_argument("--blank-ink", default="0.6,99", metavar="LO,HI",
+                    help="空白页判据：页面墨量百分比落在 [LO,HI] 之外就丢弃，"
+                         "默认 0.6,99（<0.6%%=几乎纯白，>99%%=纯黑）。关掉用 --keep-blank")
+    g3.add_argument("--ink-thr", type=int, default=200, metavar="N",
+                    help="灰度低于多少算“有墨”，默认 200（越小越严格）")
+    g3.add_argument("--wipe-v", type=float, default=45.0, metavar="PCT",
+                    help="竖向空白带超过该百分比就判为转场中间态并丢弃，默认 45")
+    g3.add_argument("--wipe-h", type=float, default=55.0, metavar="PCT",
+                    help="横向空白带超过该百分比只标记空白风险（不丢），默认 55")
 
     g4 = ap.add_argument_group("输出与杂项")
     g4.add_argument("--dedupe", dest="dedupe", action="store_true", default=None,
@@ -1584,6 +1897,29 @@ def main(argv=None):
                     help="抽帧方式：auto=先试 select 表达式，失败或候选过多自动改逐帧 seek；"
                          "select=只用表达式；seek=只用逐帧 seek（最稳，慢些）")
     g4.add_argument("--keep-temp", action="store_true", help="保留临时目录")
+    g4.add_argument("--bg-color", metavar="COLOR",
+                    help="背景统一：把课件底色换成该颜色（#RRGGBB / 白 / 米白 / rgb(…)）；"
+                         "off=不改（默认）")
+    g4.add_argument("--bg-tol", type=int, default=12, metavar="N",
+                    help="背景色容差，像素各通道与底色差 ≤N 才算“背景”，默认 12")
+    g5 = ap.add_argument_group("AI 辅助（可选）")
+    g5.add_argument("--ai", choices=("off", "export", "api"), default="off",
+                    help="AI 辅助判页：off=不用（默认）；export=只导出候选页+清单+提示词，"
+                         "等你自己交给模型；api=直接调用视觉模型判定。"
+                         "开启后**不再**用像素规则丢空白页/转场页，判断权交给 AI")
+    g5.add_argument("--ai-endpoint", metavar="URL",
+                    default=os.environ.get("SLIDE2PDF_AI_ENDPOINT",
+                                           "https://api.openai.com/v1"),
+                    help="OpenAI 兼容的 base url，默认 https://api.openai.com/v1")
+    g5.add_argument("--ai-model", metavar="NAME",
+                    default=os.environ.get("SLIDE2PDF_AI_MODEL", "gpt-4o-mini"),
+                    help="模型名，默认 gpt-4o-mini")
+    g5.add_argument("--ai-key", metavar="KEY",
+                    help="API key；也可用环境变量 SLIDE2PDF_AI_KEY / OPENAI_API_KEY")
+    g5.add_argument("--ai-batch", type=int, default=8, metavar="N",
+                    help="每次请求发几张图，默认 8")
+    g5.add_argument("--ai-apply", metavar="FILE",
+                    help="按 decisions.json（模型或人工给的 {i,keep} 列表）过滤页面")
     g4.add_argument("--bar", choices=("auto", "tqdm", "builtin"), default="auto",
                     help="进度条实现：auto=有 tqdm 就用（默认）/ tqdm / builtin=内置单行条")
     g4.add_argument("--progress", dest="progress", action="store_true", default=None,
@@ -1712,7 +2048,7 @@ def main(argv=None):
                               max_frames=a.max_frames, total=min(n_est, a.max_frames),
                               mode=a.extract_mode)
             cands = [dict(t=start + i * step / info["fps"], dwell=step / info["fps"],
-                          ink=float((np.asarray(S[i]) < 200).mean()) * 100,
+                          ink=float((np.asarray(S[i]) < a.ink_thr).mean()) * 100,
                           conf="step", blank_risk=False)
                      for i in range(len(pngs))]
         else:
@@ -1721,9 +2057,15 @@ def main(argv=None):
             a.scan_fps = float(a.scan_fps)
             A, raw = fingerprint(ffmpeg, a.video, crop, a.scan_fps, tmp,
                                  start=start, dur=dur)
+            try:
+                b_lo, b_hi = [float(x) for x in str(a.blank_ink).split(",")]
+            except ValueError:
+                raise SystemExit("--blank-ink 要写成 LO,HI，例如 0.6,99")
             cands, dropped, st = analyse(A, float(a.scan_fps), a.thr, a.min_hold,
                                          a.mask_anim, a.keep_motion,
-                                         not a.keep_blank)
+                                         not a.keep_blank and a.ai == "off",
+                                         ink_thr=a.ink_thr,
+                                         blank_lo=b_lo, blank_hi=b_hi)
             for c in cands:
                 c["t"] += start
             for d in dropped:
@@ -1750,21 +2092,65 @@ def main(argv=None):
         n0 = len(pngs)
         keep = list(range(n0)) if not dedupe_on else dedupe(S, cands, True)
 
+        ai_on = (a.ai != "off")
         # 转场中间态安全网：去重之后再剔（不改变去重的比较顺序，结果才稳定）
-        if not a.keep_wipe:
+        if ai_on:
+            log("  AI 模式：不再用像素规则丢“空白页/转场中间态”，全部候选交给 AI 判断")
+        elif not a.keep_wipe:
             kept = []
             for k in keep:
-                vc, hc = wipe_metrics(np.asarray(S[k]))
-                if vc > 0.45:                 # 整条竖向白带 = 擦除/推入的半途
-                    log("  丢弃 %s 疑似转场中间态（竖白带 %.0f%%）"
-                        % (tc(cands[k]["t"]), vc * 100))
+                vc, hc = wipe_metrics(np.asarray(S[k]), a.ink_thr)
+                if vc * 100 > a.wipe_v:       # 整条竖向白带 = 擦除/推入的半途
+                    log("  丢弃 %s 疑似转场中间态（竖白带 %.0f%% > --wipe-v %.0f）"
+                        % (tc(cands[k]["t"]), vc * 100, a.wipe_v))
                     continue
-                if hc > 0.55:                 # 只有横白带：可能只是"标题栏+空白"的首帧
+                if hc * 100 > a.wipe_h:       # 只有横白带：可能只是"标题栏+空白"的首帧
                     cands[k]["blank_risk"] = True
-                    log("  提示 %s 横向空白较多（%.0f%%），已标记空白风险"
-                        % (tc(cands[k]["t"]), hc * 100))
+                    log("  提示 %s 横向空白较多（%.0f%% > --wipe-h %.0f），已标记空白风险"
+                        % (tc(cands[k]["t"]), hc * 100, a.wipe_h))
                 kept.append(k)
             keep = kept
+
+        # ---------- AI 辅助（可选）----------
+        if ai_on or a.ai_apply:
+            stem = re.sub(r"\.pdf$", "", os.path.basename(out))
+            ai_dir = os.path.join(os.path.dirname(out) or ".", stem + ".ai")
+            if ai_on:
+                ai_export(ai_dir, cands, keep, pngs, S,
+                          dict(video=os.path.basename(a.video), pages=n0))
+                log("  AI 清单：%s（%d 张候选页 + manifest.json + prompt.md）"
+                    % (ai_dir, n0))
+            dec = None
+            if a.ai == "api":
+                key = (a.ai_key or os.environ.get("SLIDE2PDF_AI_KEY")
+                       or os.environ.get("OPENAI_API_KEY"))
+                dec = ai_decide(ai_dir, cands, S, a.ai_endpoint, key,
+                                a.ai_model, a.ai_batch)
+            elif a.ai_apply:
+                dec = load_decisions(a.ai_apply)
+                log("  按 %s 过滤页面…" % a.ai_apply)
+            if dec is not None:
+                before = len(keep)
+                keep = [k for k in keep if dec.get(k, True)]
+                log("  AI/人工决定：%d → %d 页（丢弃 %d）"
+                    % (before, len(keep), before - len(keep)))
+
+        # ---------- 背景统一（可选）----------
+        target = parse_color(a.bg_color) if a.bg_color else None
+        if target:
+            log("  背景统一：把每页底色换成 rgb%s（容差 %d）…"
+                % (str(target), a.bg_tol))
+            fr = [(i * step if step_mode else cands[i]["frame"]) for i in keep]
+            times = [cands[i]["t"] for i in keep]
+            sel = select_expr(fr)
+            prefix = ("crop=%d:%d:%d:%d,%sselect='%s'"
+                      % (crop[0], crop[1], crop[2], crop[3],
+                         "" if step_mode else "fps=%s," % a.scan_fps, sel))
+            n_ok = apply_bg(ffmpeg, a.video, crop, [pngs[i] for i in keep],
+                            target, a.bg_tol, vf_prefix=prefix, times=times,
+                            start=start)
+            log("  背景统一完成：%d/%d 页" % (n_ok, len(keep)))
+
         pages = [pngs[i] for i in keep]
         log("[%s] 页数：%d%s" % ("2/2" if step_mode else "3/3", len(pages),
                                  "" if not dedupe_on else "（去重前 %d）" % n0))
