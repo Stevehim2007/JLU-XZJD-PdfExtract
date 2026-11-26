@@ -1735,13 +1735,33 @@ def _ai_request(endpoint, key, model, images, timeout=180):
                         "image_url": {"url": "data:image/png;base64," + b64}})
     body = json.dumps(dict(model=model, temperature=0, max_tokens=2048,
                            messages=[dict(role="user", content=content)]))
+    import urllib.error
     req = urllib.request.Request(
         endpoint.rstrip("/") + "/chat/completions",
         data=body.encode("utf-8"),
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + key})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        body_txt = e.read().decode("utf-8", "replace")[:400]
+        hint = {
+            401: "密钥不对或过期（检查 --ai-key / 环境变量）",
+            403: "这个 key 没权限 / 该模型未开通",
+            404: "endpoint 或模型名不对（base url 通常要以 /v1 结尾）",
+            429: "限流或余额不足",
+        }.get(e.code, "")
+        raise SystemExit("AI 接口返回 HTTP %d%s\n%s" % (e.code, "：" + hint if hint else "", body_txt))
+    except urllib.error.URLError as e:
+        raise SystemExit("连不上 AI 接口：%s\n  检查 endpoint（%s）和网络/代理"
+                         % (e.reason, endpoint))
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise SystemExit("AI 接口返回的不是 JSON：\n" + raw[:400])
+    if "choices" not in data:
+        raise SystemExit("AI 接口返回里没有 choices：\n" + raw[:400])
     return data["choices"][0]["message"]["content"]
 
 
@@ -1798,6 +1818,50 @@ def _parse_ai_json(txt):
             pass
     log("  警告：模型返回的不是合法 JSON，这一批全部按 keep 处理")
     return []
+
+
+def ai_test(endpoint, key, model, timeout=60):
+    """发一张 80x60 的测试图，验证"地址 + 模型 + 密钥 + 图像能力"四件事。"""
+    a = np.full((60, 80, 3), 235, np.uint8)
+    a[18:42, 12:68] = 20
+    a[8:14, 12:60] = (200, 60, 40)
+    b64 = _b64_png(80, 60, a.tobytes(), 0)
+    prompt = ("这是一张测试图（灰色底、深色块、红色条）。只回一行紧凑 JSON："
+              '{"ok":true,"desc":"你看到的内容"}')
+    content = [{"type": "text", "text": prompt},
+               {"type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + b64}}]
+    body = json.dumps(dict(model=model, temperature=0, max_tokens=200,
+                           messages=[dict(role="user", content=content)]))
+    import urllib.request
+    import urllib.error
+    log("AI 自检：endpoint=%s" % endpoint.rstrip("/"))
+    log("           model=%s  key=%s…" % (model, (key[:6] + "***") if key else "（空）"))
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(
+                    endpoint.rstrip("/") + "/chat/completions",
+                    data=body.encode("utf-8"),
+                    headers={"Content-Type": "application/json",
+                             "Authorization": "Bearer " + (key or "")}),
+                timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        txt = e.read().decode("utf-8", "replace")[:400]
+        raise SystemExit("❌ HTTP %d（%.1fs）\n%s" % (e.code, time.time() - t0, txt))
+    except urllib.error.URLError as e:
+        raise SystemExit("❌ 连不上：%s（%.1fs）\n  检查 endpoint / 网络 / 代理"
+                         % (e.reason, time.time() - t0))
+    dt = time.time() - t0
+    try:
+        data = json.loads(raw)
+        txt = data["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError):
+        raise SystemExit("❌ 返回格式不对（%.1fs）：\n%s" % (dt, raw[:400]))
+    log("✅ 通了（%.1fs）。模型回复：%s" % (dt, txt.strip().replace("\n", " ")[:200]))
+    log("   能用图像的话，回复里应能看出“灰色底 + 深色块/红色条”。")
+    return 0
 
 
 def load_decisions(path):
@@ -1918,6 +1982,8 @@ def main(argv=None):
                     help="API key；也可用环境变量 SLIDE2PDF_AI_KEY / OPENAI_API_KEY")
     g5.add_argument("--ai-batch", type=int, default=8, metavar="N",
                     help="每次请求发几张图，默认 8")
+    g5.add_argument("--ai-test", action="store_true",
+                    help="只做 AI 连通性自检：发一张测试图，验证 地址/模型/密钥/图像能力")
     g5.add_argument("--ai-apply", metavar="FILE",
                     help="按 decisions.json（模型或人工给的 {i,keep} 列表）过滤页面")
     g4.add_argument("--bar", choices=("auto", "tqdm", "builtin"), default="auto",
@@ -1933,6 +1999,14 @@ def main(argv=None):
     BAR_LIB = a.bar
     DOWNLOAD_POLICY = a.download
     ASSUME_YES = bool(getattr(a, "yes", False))
+    if getattr(a, "ai_test", False):
+        key = (a.ai_key or os.environ.get("SLIDE2PDF_AI_KEY")
+               or os.environ.get("OPENAI_API_KEY"))
+        if not key:
+            log("⚠ 没有密钥：可以用 --ai-key 直接给，或设环境变量 "
+                "SLIDE2PDF_AI_KEY / OPENAI_API_KEY")
+        return ai_test(a.ai_endpoint, key, a.ai_model)
+
     if a.doctor:                                 # 只做自检，不需要视频
         doctor(a.ffmpeg, a.ffprobe)
         return 0
